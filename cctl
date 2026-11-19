@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 fundacoder
+"""cctl (Claude Code ctl) — list, resume and clean up Claude Code sessions.
+
+Shows saved and open sessions with their /rename names, resumes them from any
+folder, and can delete them.
+
+Claude Code is a product of Anthropic. cctl is an unofficial utility for Claude
+Code users, not made by or affiliated with Anthropic: it is only a wrapper
+script that reads Claude Code's local session files and runs the `claude` CLI.
+
+Reads transcripts from ~/.claude/projects/<project>/<session-id>.jsonl and
+live-process records from ~/.claude/sessions/<pid>.json.
+
+Examples:
+  cctl                          # all sessions, newest first (= cctl ls)
+  cctl ls -n -l                 # numbered, open sessions marked (open)
+  cctl ls -v                    # full session IDs and transcript paths
+  cctl ls --named -p api        # renamed sessions in folders matching "api"
+  cctl ls -m 10 --json          # newest 10, as JSON
+
+  cctl resume my-name           # resume by /rename name, from any folder
+  cctl resume -p api            # pick from sessions in folders matching "api"
+  cctl resume 3 -- --model opus # list number; args after -- go to claude
+
+  cctl rm my-name               # delete by name, ID (or prefix), or number
+  cctl rm -p /tmp/x --all       # delete every session under a folder
+"""
+
+import argparse
+import json
+import os
+import shlex
+import textwrap
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+__version__ = "0.2.0"
+DISCLAIMER = ("Claude Code is a product of Anthropic. cctl is an unofficial utility\n"
+              "for Claude Code users, not made by or affiliated with Anthropic: it is\n"
+              "only a wrapper script around Claude Code's local files and `claude` CLI.")
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+SESSIONS_DIR = CLAUDE_DIR / "sessions"
+FILE_HISTORY_DIR = CLAUDE_DIR / "file-history"
+SESSION_ENV_DIR = CLAUDE_DIR / "session-env"
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def load_open_sessions():
+    """Map sessionId -> live process record for Claude processes still running."""
+    live = {}
+    if not SESSIONS_DIR.is_dir():
+        return live
+    for f in SESSIONS_DIR.glob("*.json"):
+        try:
+            rec = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        sid, pid = rec.get("sessionId"), rec.get("pid")
+        if sid and isinstance(pid, int) and pid_alive(pid):
+            live[sid] = rec
+    return live
+
+
+def first_prompt_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                return part.get("text", "")
+    return ""
+
+
+def parse_transcript(path):
+    info = {
+        "session_id": path.stem,
+        "cwd": None,
+        "custom_title": None,
+        "ai_title": None,
+        "first_prompt": None,
+        "messages": 0,
+        "modified": datetime.fromtimestamp(path.stat().st_mtime),
+        "file": str(path),
+    }
+    try:
+        fh = path.open(encoding="utf-8", errors="replace")
+    except OSError:
+        return info
+    with fh:
+        for line in fh:
+            # Cheap substring checks before paying for json.loads on big lines.
+            is_title = '"custom-title"' in line or '"ai-title"' in line
+            is_msg = '"type":"user"' in line or '"type":"assistant"' in line
+            need_cwd = info["cwd"] is None and '"cwd"' in line
+            if not (is_title or is_msg or need_cwd):
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            t = e.get("type")
+            if t == "custom-title" and e.get("customTitle"):
+                info["custom_title"] = e["customTitle"]  # last one wins
+            elif t == "ai-title" and e.get("aiTitle"):
+                info["ai_title"] = e["aiTitle"]
+            if need_cwd and e.get("cwd"):
+                info["cwd"] = e["cwd"]
+            if t in ("user", "assistant") and not e.get("isSidechain"):
+                info["messages"] += 1
+                if (t == "user" and info["first_prompt"] is None
+                        and not e.get("isMeta")):
+                    text = first_prompt_text((e.get("message") or {}).get("content"))
+                    text = " ".join(text.split())
+                    if text and not text.startswith("<"):
+                        info["first_prompt"] = text
+    return info
+
+
+def collect(live):
+    sessions = {}
+    if PROJECTS_DIR.is_dir():
+        for path in PROJECTS_DIR.glob("*/*.jsonl"):
+            s = parse_transcript(path)
+            if s["cwd"] is None:
+                s["cwd"] = path.parent.name
+            if not s["custom_title"]:
+                try:
+                    side = json.loads((path.with_suffix("") / "custom-title.json").read_text())
+                    s["custom_title"] = side.get("customTitle") or None
+                except (OSError, ValueError, AttributeError):
+                    pass
+            sessions[s["session_id"]] = s
+    # Open sessions that have not written a transcript yet.
+    for sid, rec in live.items():
+        if sid not in sessions:
+            sessions[sid] = {
+                "session_id": sid, "cwd": rec.get("cwd"), "custom_title": None,
+                "ai_title": None, "first_prompt": None, "messages": 0,
+                "modified": datetime.fromtimestamp((rec.get("updatedAt") or 0) / 1000),
+                "file": None,
+            }
+    for sid, s in sessions.items():
+        rec = live.get(sid)
+        s["open"] = rec is not None
+        s["pid"] = rec.get("pid") if rec else None
+        s["status"] = rec.get("status") if rec else None
+        # A live process may carry a newer user-set name than the transcript.
+        if rec and rec.get("name") and rec.get("nameSource") not in (None, "derived"):
+            s["custom_title"] = s["custom_title"] or rec["name"]
+    return list(sessions.values())
+
+
+def shorten(text, width):
+    if not text:
+        return ""
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def session_paths(r):
+    """Every file/dir on disk that belongs to this session."""
+    sid, paths = r["session_id"], []
+    if r["file"]:
+        t = Path(r["file"])
+        paths += [t, t.with_suffix("")]  # transcript + <id>/ (subagents, sidecars)
+    paths += [FILE_HISTORY_DIR / sid, SESSION_ENV_DIR / sid]
+    return [p for p in paths if p.exists()]
+
+
+def resolve_target(target, rows):
+    """Find delete candidates for TARGET.
+
+    Returns a list of (row, reason) pairs. reason is None only for a clean
+    match: exactly one session whose /rename name equals TARGET, with TARGET
+    not also being a substring of any other name or a session-ID prefix.
+    Anything else (duplicate names, substring matches, ID or list-number
+    matches) carries a reason and must be confirmed explicitly.
+    """
+    t = target.lower()
+    exact = [r for r in rows if (r["custom_title"] or "").lower() == t]
+    by_num = []
+    if target.isdigit() and 1 <= int(target) <= len(rows):
+        # A plain number means a list number. It only competes with an exact
+        # name, not with names that merely contain the digit.
+        by_num, partial = [rows[int(target) - 1]], []
+    else:
+        partial = [r for r in rows if r not in exact and t in (r["custom_title"] or "").lower()]
+    # Session-ID prefixes need 4+ characters so short inputs don't hit random IDs.
+    by_id = [r for r in rows if len(t) >= 4 and r["session_id"].lower().startswith(t)]
+
+    if len(exact) == 1 and not partial and not by_num and all(r is exact[0] for r in by_id):
+        return [(exact[0], None)]
+
+    out, seen = [], set()
+    def add(r, reason):
+        if r["session_id"] not in seen:
+            seen.add(r["session_id"])
+            out.append((r, reason))
+    for r in by_num:
+        add(r, f"selected by list number {target}")
+    for r in exact:
+        add(r, f"duplicate name: {len(exact)} sessions are named {r['custom_title']!r}"
+            if len(exact) > 1 else
+            f"exact name, but {target!r} is also part of {len(partial)} other name(s)")
+    for r in partial:
+        add(r, f"partial name match: {target!r} is only part of {r['custom_title']!r}")
+    for r in by_id:
+        add(r, "matched by session ID" if r["session_id"].lower() == t
+            else f"matched by session-ID prefix {target!r}")
+    return out
+
+
+def describe(r):
+    label = r["custom_title"] or "(unnamed) " + shorten(r["ai_title"] or r["first_prompt"] or "", 50)
+    when = r["modified"].strftime("%Y-%m-%d %H:%M")
+    return f"{r['session_id']}  {when}  {r['messages']} msgs  {label}"
+
+
+def pick(cands, verb, multi):
+    """Show numbered candidates and let the user choose. Returns chosen rows."""
+    home = str(Path.home())
+    for i, (r, reason) in enumerate(cands, 1):
+        print(f"  {i}: {describe(r)}")
+        extra = f"  ({reason})" if reason else ""
+        print(f"       {(r['cwd'] or '').replace(home, '~', 1)}{extra}")
+    if not sys.stdin.isatty():
+        print(f"cctl: several sessions match; re-run in a terminal to choose, "
+              f"or use a full session ID / exact name", file=sys.stderr)
+        return None
+    hint = "numbers e.g. '1 3', 'all', Enter = none" if multi else "number, Enter = cancel"
+    answer = ask(f"  {verb} which? [{hint}] ")
+    if multi and answer in ("all", "a"):
+        return [r for r, _ in cands]
+    try:
+        picks = sorted({int(x) for x in answer.replace(",", " ").split()})
+    except ValueError:
+        picks = None
+    if not picks or (not multi and len(picks) > 1) or any(not 1 <= i <= len(cands) for i in picks):
+        print("  invalid choice, nothing selected" if answer else "  nothing selected")
+        return []
+    return [cands[i - 1][0] for i in picks]
+
+
+def ask(prompt):
+    try:
+        return input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def delete_sessions(targets, rows, assume_yes, force):
+    """Resolve targets, confirm as needed, then delete."""
+    sys.stdout.reconfigure(line_buffering=True)  # keep stdout/stderr in order
+    plan, errors = [], 0  # plan: list of (row, reason_or_None)
+    interactive = sys.stdin.isatty()
+    for target in targets:
+        cands = resolve_target(target, rows)
+        if not cands:
+            print(f"cctl: no session matches {target!r}", file=sys.stderr)
+            errors += 1
+            continue
+        if len(cands) == 1:
+            plan.append(cands[0])
+            continue
+        # Several candidates: the user must pick which ones.
+        print(f"{target!r} matches {len(cands)} sessions:")
+        chosen = pick(cands, "Delete", multi=True)
+        if chosen is None:
+            errors += 1
+        for r in chosen or []:
+            plan.append((r, "picked"))  # picking counts as confirmation
+
+    home, done = str(Path.home()), set()
+    for r, reason in plan:
+        if r["session_id"] in done:
+            continue
+        done.add(r["session_id"])
+        print(describe(r))
+        if r["open"] and not force:
+            print(f"    skipped: session is open (pid {r['pid']}); use --force to delete anyway")
+            errors += 1
+            continue
+        paths = session_paths(r)
+        if not paths:
+            print("    nothing on disk to delete")
+            continue
+        for p in paths:
+            print(f"    {str(p).replace(home, '~', 1)}{'/' if p.is_dir() else ''}")
+
+        risky = reason not in (None, "picked")
+        if risky or (reason is None and not assume_yes):
+            if risky:
+                print(f"    ! confirm needed: {reason}")
+            if not interactive:
+                hint = ("use an exact, unique /rename name with -y to skip confirmation"
+                        if risky else "pass -y to confirm")
+                print(f"    skipped: not a terminal; {hint}", file=sys.stderr)
+                errors += 1
+                continue
+            if ask("    Delete this session? [y/N] ") not in ("y", "yes"):
+                print("    kept")
+                continue
+        errors += remove_paths(paths)
+    return 1 if errors else 0
+
+
+def remove_paths(paths):
+    errors = 0
+    for p in paths:
+        try:
+            shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+        except OSError as e:
+            print(f"    error deleting {p}: {e}", file=sys.stderr)
+            errors += 1
+    print("    deleted" if not errors else "    partly deleted")
+    return errors
+
+
+def delete_all(rows, prefix, force):
+    """Delete every listed session, after one confirmation. Requires -p."""
+    sys.stdout.reconfigure(line_buffering=True)
+    if not prefix or not prefix.strip(" /~.*"):
+        print("cctl: deleting all needs -p/--project with a real folder, "
+              "e.g. -p /tmp/my-scratch-dir", file=sys.stderr)
+        return 2
+    if not rows:
+        print(f"No sessions match -p {prefix!r}; nothing to delete.")
+        return 0
+    targets, skipped = [], []
+    for r in rows:
+        (skipped if r["open"] and not force else targets).append(r)
+
+    print(f"Sessions in folders matching {prefix!r}:")
+    width = len(str(len(rows)))
+    for i, r in enumerate(rows, 1):
+        tag = f"   (open, pid {r['pid']}: will be skipped)" if r in skipped else ""
+        print(f"{i:>{width}}: {describe(r)}{tag}")
+        print(f"{' ' * width}    {r['cwd']}")
+    if skipped:
+        print(f"\n{len(skipped)} open session(s) will be kept; use --force to include them.")
+    if not targets:
+        print("Nothing to delete.")
+        return 1
+    if not sys.stdin.isatty():
+        print("cctl: deleting all must be confirmed in a terminal", file=sys.stderr)
+        return 1
+    if ask(f"\nDelete these {len(targets)} session(s)? [y/N] ") not in ("y", "yes"):
+        print("Nothing deleted.")
+        return 1
+    failed = 0
+    for r in targets:
+        print(describe(r))
+        if remove_paths(session_paths(r)):
+            failed += 1
+    print(f"\nDeleted {len(targets) - failed} of {len(targets)} session(s).")
+    return 1 if failed or skipped else 0
+
+
+def resume_session(target, rows, extra, force, dry_run):
+    """Find a session in any folder, cd into its folder and exec `claude --resume`."""
+    if target:
+        cands = resolve_target(target, rows)
+        if not cands:
+            print(f"cctl: no session matches {target!r}", file=sys.stderr)
+            return 1
+    else:
+        cands = [(r, None) for r in rows]
+        if not cands:
+            print("cctl: no sessions match the filters", file=sys.stderr)
+            return 1
+    if len(cands) == 1:
+        r = cands[0][0]
+    else:
+        print(f"{len(cands)} sessions match{' ' + repr(target) if target else ''}:")
+        chosen = pick(cands, "Resume", multi=False)
+        if not chosen:
+            return 1
+        r = chosen[0]
+
+    name = r["custom_title"] or r["ai_title"] or r["session_id"]
+    cwd = r["cwd"]
+    if not cwd or not os.path.isdir(cwd):
+        print(f"cctl: can't resume {name!r}: its folder no longer exists ({cwd}).\n"
+              f"      Claude Code resumes a session from the folder it was started in.",
+              file=sys.stderr)
+        return 1
+    if r["open"] and not force:
+        print(f"cctl: {name!r} is already open (pid {r['pid']}). Two copies of the same "
+              f"session will write over each other.", file=sys.stderr)
+        if not sys.stdin.isatty() or ask("      Resume anyway? [y/N] ") not in ("y", "yes"):
+            print("      not resumed (use --force to skip this check)", file=sys.stderr)
+            return 1
+
+    claude = os.environ.get("CCTL_CLAUDE", "claude")
+    cmd = [claude, "--resume", r["session_id"], *extra]
+    if dry_run:
+        print(f"cd {shlex.quote(cwd)} && {shlex.join(cmd)}")
+        return 0
+    if not shutil.which(claude):
+        print(f"cctl: {claude!r} not found on PATH (set CCTL_CLAUDE to override)", file=sys.stderr)
+        return 127
+    print(f"Resuming {name!r} in {cwd.replace(str(Path.home()), '~', 1)}", file=sys.stderr)
+    os.chdir(cwd)
+    os.execvp(cmd[0], cmd)  # hand the terminal over to claude; does not return
+
+
+def filtered_rows(args, live):
+    rows = collect(live)
+    if getattr(args, "open", False):
+        rows = [r for r in rows if r["open"]]
+    if args.named:
+        rows = [r for r in rows if r["custom_title"]]
+    if args.project:
+        rows = [r for r in rows if args.project.lower() in (r["cwd"] or "").lower()]
+    rows.sort(key=lambda r: r["modified"], reverse=True)
+    if args.limit:
+        rows = rows[: args.limit]
+    return rows
+
+
+def print_list(rows, args):
+    if args.json:
+        out = []
+        for r in rows:
+            d = dict(r, modified=r["modified"].isoformat(timespec="seconds"))
+            if not args.status:
+                for k in ("open", "pid", "status"):
+                    d.pop(k, None)
+            out.append(d)
+        json.dump(out, sys.stdout, indent=2)
+        print()
+        return
+
+    if not rows:
+        used = [f"-p {args.project!r}" if args.project else "",
+                "--named" if args.named else "", "--open" if args.open else ""]
+        used = " ".join(u for u in used if u)
+        print(f"No sessions match {used}." if used else "No sessions found.")
+        return
+
+    color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    bold = (lambda t: f"\033[1m{t}\033[0m") if color else (lambda t: t)
+    green = (lambda t: f"\033[32m{t}\033[0m") if color else (lambda t: t)
+    dim = (lambda t: f"\033[2m{t}\033[0m") if color else (lambda t: t)
+    home = str(Path.home())
+
+    width = len(str(len(rows)))
+    for i, r in enumerate(rows, 1):
+        num = f"{i:>{width}}: " if args.number else ""
+        pad = " " * len(num)
+        sid = r["session_id"] if args.long else r["session_id"][:8]
+        when = r["modified"].strftime("%Y-%m-%d %H:%M")
+        cwd = (r["cwd"] or "").replace(home, "~", 1)
+        if r["custom_title"]:
+            name = bold(r["custom_title"])
+        else:
+            name = dim("(unnamed) ") + shorten(r["ai_title"] or r["first_prompt"] or "", 60)
+        tag = ""
+        if args.status and r["open"]:
+            tag = " " + green(f"(open{', ' + r['status'] if r['status'] else ''}, pid {r['pid']})")
+        print(f"{num}{sid}  {when}  {r['messages']:>5} msgs  {cwd}")
+        print(f"{pad}    {name}{tag}")
+        if args.long and r["file"]:
+            print(dim(f"{pad}    {r['file'].replace(home, '~', 1)}"))
+
+    n_open = sum(1 for r in rows if r.get("open"))
+    summary = f"\n{len(rows)} session(s)"
+    if args.status:
+        summary += f", {n_open} open"
+    print(dim(summary))
+    print(dim("Resume: cctl resume <name|id|number>   Delete: cctl rm <name|id|number>"))
+
+
+COMMANDS = {"ls": "ls", "list": "ls", "resume": "resume", "r": "resume",
+            "rm": "rm", "delete": "rm"}
+
+
+def build_parser():
+    filters = argparse.ArgumentParser(add_help=False)
+    g = filters.add_argument_group("filters (numbers from `cctl ls -n` refer to the same filtered list)")
+    g.add_argument("-p", "--project", metavar="TEXT",
+                   help="only sessions whose folder contains TEXT")
+    g.add_argument("--named", action="store_true", help="only sessions renamed with /rename")
+    g.add_argument("-o", "--open", action="store_true",
+                   help="only sessions that are currently open (implies -l)")
+    g.add_argument("-m", "--limit", type=int, metavar="N", help="at most N newest sessions")
+
+    ap = argparse.ArgumentParser(
+        prog="cctl",
+        description="cctl (Claude Code ctl): list, resume and clean up Claude Code "
+                    "sessions across all folders, by /rename name, ID or list number.",
+        epilog="Run `cctl <command> -h` for details. With no command, cctl runs `ls`.")
+    sub = ap.add_subparsers(dest="cmd", metavar="<command>")
+
+    ls = sub.add_parser("ls", aliases=["list"], parents=[filters],
+                        help="list sessions (default)", description="List sessions, newest first.")
+    ls.add_argument("-l", "--list", dest="status", action="store_true",
+                    help="list which sessions are open, e.g. (open, busy, pid 123)")
+    ls.add_argument("--status", dest="status", action="store_true", help=argparse.SUPPRESS)
+    ls.add_argument("-n", "--number", action="store_true",
+                    help="number the list (numbers work with resume and rm)")
+    ls.add_argument("-v", "--verbose", "--long", dest="long", action="store_true",
+                    help="also show the full session ID and transcript path")
+    ls.add_argument("--json", action="store_true", help="output JSON")
+    # Older flag-style deletes, kept as aliases for `cctl rm`.
+    ls.add_argument("-d", "--delete", nargs="+", metavar="TARGET", help=argparse.SUPPRESS)
+    ls.add_argument("--delete-all", action="store_true", help=argparse.SUPPRESS)
+    ls.add_argument("-y", "--yes", action="store_true", help=argparse.SUPPRESS)
+    ls.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
+
+    rs = sub.add_parser(
+        "resume", aliases=["r"], parents=[filters],
+        help="resume a session from any folder",
+        description="Find a session in any folder, switch to that folder and run "
+                    "`claude --resume <id>`. With no TARGET, pick from the (filtered) list.",
+        epilog="Anything after `--` is passed to claude, e.g. "
+               "`cctl resume my-name -- --model opus`. Set CCTL_CLAUDE to use another claude binary.")
+    rs.add_argument("target", nargs="?", metavar="TARGET",
+                    help="/rename name (or part of it), session ID (or prefix), or list number")
+    rs.add_argument("--force", action="store_true", help="resume even if the session is already open")
+    rs.add_argument("--dry-run", action="store_true",
+                    help="print the command instead of running it")
+
+    rm = sub.add_parser(
+        "rm", aliases=["delete"], parents=[filters],
+        help="delete sessions",
+        description="Delete sessions by name, ID or list number. Only an exact, unique "
+                    "/rename name can skip confirmation (with -y); IDs, numbers, duplicate "
+                    "or partial names always ask.")
+    rm.add_argument("targets", nargs="*", metavar="TARGET",
+                    help="/rename name (or part of it), session ID (or prefix), or list number")
+    rm.add_argument("--all", action="store_true",
+                    help="delete every session matched by -p (required), after one confirmation")
+    rm.add_argument("-y", "--yes", action="store_true",
+                    help="don't ask for an exact, unique /rename name match")
+    rm.add_argument("--force", action="store_true", help="also delete sessions that are open")
+
+    overview = build_overview(filters, [
+        ("ls, list", "[options]", ls, "list sessions, newest first (the default)"),
+        ("resume, r", "[TARGET] [options] [-- claude-args]", rs,
+         "resume a session from any folder (cd + claude --resume)"),
+        ("rm, delete", "[TARGET ...] [options]", rm, "delete sessions, with confirmation"),
+    ])
+    ap.format_help = lambda: overview
+    ap.usage = "cctl [<command>] [options]   (cctl -h for everything)"
+    return ap
+
+
+def build_overview(filters, commands):
+    """One help page listing every command, option and rule, built from the parsers."""
+    width = max(60, min(shutil.get_terminal_size((80, 24)).columns, 100))
+    filter_dests = {a.dest for a in filters._actions}
+
+    def opt_lines(actions):
+        out = []
+        for a in actions:
+            if a.help == argparse.SUPPRESS or a.dest == "help":
+                continue
+            if a.option_strings:
+                name = ", ".join(a.option_strings)
+                if a.nargs != 0:
+                    name += f" {a.metavar or a.dest.upper()}"
+            else:
+                name = a.metavar or a.dest.upper()
+                if a.nargs in ("*", "+"):
+                    name += " ..."
+            text = textwrap.wrap(a.help or "", width - 26) or [""]
+            if len(name) > 20:
+                out.append(f"    {name}")
+                out += [f"{'':24}{t}" for t in text]
+            else:
+                out.append(f"    {name:<20}{text[0]}")
+                out += [f"{'':24}{t}" for t in text[1:]]
+        return out
+
+    lines = [
+        "usage: cctl [<command>] [options]",
+        "",
+        "cctl (Claude Code ctl): list, resume and clean up Claude Code sessions across",
+        "all folders. With no command, cctl runs `ls`.",
+        "",
+        "Commands:",
+    ]
+    for name, args, p, summary in commands:
+        lines.append(f"  {name:<14}{summary}")
+    lines += ["", "Choosing a session (TARGET, for resume and rm):",
+              "    my-name         /rename name; part of a name also works, after a check",
+              "    1a2b3c4d...     session ID, or its first 4+ characters",
+              "    3               number from `cctl ls -n` (use the same filters)",
+              "",
+              "Filters (every command):"]
+    lines += opt_lines(filters._actions)
+    for name, args, p, summary in commands:
+        lines += ["", f"cctl {name.split(',')[0]} {args}"]
+        lines += opt_lines([a for a in p._actions if a.dest not in filter_dests])
+    lines += [
+        "",
+        "Other:",
+        "    -h, --help          this page; `cctl <command> -h` for one command",
+        "    -v, --version       print the version (as the first argument; `cctl ls -v`",
+        "                        is verbose)",
+        "",
+        "Safety:",
+        "    rm asks before deleting, except an exact, unique /rename name with -y.",
+        "    IDs, list numbers, duplicate or partial names always ask, even with -y.",
+        "    rm --all needs -p, shows the list and asks once. Open sessions are never",
+        "    deleted or resumed twice without --force (or a yes at the prompt).",
+        "",
+        "Older flags (still work):",
+        "    cctl -d TARGET ...        same as  cctl rm TARGET ...",
+        "    cctl --delete-all -p X    same as  cctl rm --all -p X",
+        "",
+        "Environment:",
+        "    CLAUDE_CONFIG_DIR   Claude Code data folder (default ~/.claude)",
+        "    CCTL_CLAUDE         claude program used by resume (default: claude on PATH)",
+        "    NO_COLOR            turn off colors",
+        "",
+    ]
+    examples = __doc__[__doc__.index("Examples:"):].rstrip()
+    lines += examples.splitlines()
+    lines += ["", *DISCLAIMER.splitlines()]
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    sys.stdout.reconfigure(line_buffering=True)  # keep stdout/stderr in order
+    argv = sys.argv[1:]
+    extra = []
+    if "--" in argv:  # passthrough arguments for claude
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    if argv and not argv[0].startswith("-") and argv[0] not in COMMANDS:
+        print(f"cctl: unknown command {argv[0]!r} (commands: ls, resume, rm; "
+              f"see cctl -h)", file=sys.stderr)
+        sys.exit(2)
+    if argv[:1] in (["-v"], ["--version"]):
+        print(f"cctl {__version__}\n\n{DISCLAIMER}")
+        sys.exit(0)
+    if not argv or (argv[0] not in COMMANDS and argv[0] not in ("-h", "--help")):
+        argv = ["ls", *argv]  # bare `cctl` / old flag style means `cctl ls`
+
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    cmd = COMMANDS[args.cmd]
+    if extra and cmd != "resume":
+        ap.error("arguments after `--` are only used by `cctl resume`")
+
+    # Old flag-style deletes map onto rm.
+    if cmd == "ls" and (args.delete or args.delete_all):
+        if args.delete and args.delete_all:
+            ap.error("use either --delete or --delete-all, not both")
+        cmd, args.targets, args.all = "rm", args.delete or [], args.delete_all
+
+    if args.open:
+        args.status = True
+    # Open status is always needed by resume and rm, to protect running sessions.
+    live = load_open_sessions() if (cmd != "ls" or args.status) else {}
+    rows = filtered_rows(args, live)
+
+    if cmd == "ls":
+        print_list(rows, args)
+    elif cmd == "resume":
+        sys.exit(resume_session(args.target, rows, extra, args.force, args.dry_run))
+    else:
+        if args.all:
+            if args.targets:
+                ap.error("use either TARGETs or --all, not both")
+            if not args.project:
+                ap.error("--all only works together with -p/--project (to avoid wiping everything)")
+            sys.exit(delete_all(rows, args.project, args.force))
+        if not args.targets:
+            ap.error("rm needs at least one TARGET, or --all with -p")
+        sys.exit(delete_sessions(args.targets, rows, args.yes, args.force))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        sys.exit(0)
