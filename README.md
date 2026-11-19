@@ -22,6 +22,14 @@ $ cctl ls -n -l
 
 ## Why
 
+You `/rename` a session `cctl-dev`, get pulled onto something else, and two weeks later you want it back. Which folder was it in? Where did you clone that repo? What was the session ID? With cctl, from any folder:
+
+```sh
+cctl resume cctl-dev
+```
+
+cctl finds the session, switches to its folder and resumes it. It's all terminal, so it works the same over SSH on a headless machine.
+
 - **Find sessions in every folder at once.** `claude --resume` works per folder. cctl lists sessions from all of them, with the names you gave them via `/rename`.
 - **Resume from anywhere.** `cctl resume q4-planning` switches to the session's original folder and starts `claude --resume` there.
 - **See what's running.** `-l` marks sessions that are open in another terminal, so you don't resume the same one twice.
