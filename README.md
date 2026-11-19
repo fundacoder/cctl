@@ -2,6 +2,8 @@
 
 **The missing Claude Code ctl that power users would love to see.**
 
+> **Fun fact:** no prize for guessing — cctl was written by Claude Code.
+
 A small command-line tool for [Claude Code](https://code.claude.com/docs/en/overview) power users: list every session you have across all folders, see their `/rename` names and which ones are open right now, resume any of them from anywhere, and clean up the ones you no longer need.
 
 > **Disclaimer:** Claude Code is a product of Anthropic. cctl is an unofficial utility for Claude Code users, not made by or affiliated with Anthropic. It is only a wrapper script that reads Claude Code's local session files and runs the `claude` CLI.
