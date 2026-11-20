@@ -56,6 +56,7 @@ With no command, `cctl` runs `cctl ls`. Run `cctl -h` (or `cctl help`) for the f
 ```sh
 cctl                      # all sessions, newest first
 cctl ls -n                # numbered, for use with resume and rm
+cctl ls -f api            # only sessions in folders matching "api"
 cctl ls -ltr              # long format, newest at the bottom (like ls -ltr)
 cctl ls -S -m 5           # the 5 biggest sessions by message count
 cctl ls -N -f api         # renamed sessions in folders matching "api"
@@ -237,10 +238,6 @@ Standard library only; nothing to install.
 ## Compatibility
 
 Developed and tested on macOS. It should also work on Linux (it uses `ps` to spot headless sessions); Windows is untested. Needs Python 3.8 or newer.
-
-## Credits
-
-`cctl watch` is adapted from the `watch` command of the author's own agent harness.
 
 ## License
 

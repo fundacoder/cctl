@@ -617,9 +617,8 @@ def log_session(target, rows, tail, tools, use_pager):
     return 0
 
 
-# watch: a live feed of what sessions do, one line per action. Adapted from the
-# `watch` command of the author's piri-harness, rewritten for Claude Code's own
-# transcripts so it works on any session, interactive or headless.
+# watch: a live feed of what sessions do, one line per action. Reads Claude
+# Code's own transcripts, so it works on any session, interactive or headless.
 WATCH_PREFER = ("description", "file_path", "command", "pattern", "path", "query", "url",
                 "prompt", "task_id")
 
