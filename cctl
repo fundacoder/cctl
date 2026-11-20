@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 fundacoder
-"""cctl (Claude Code ctl) — list, resume and clean up Claude Code sessions.
+"""cctl (Claude Code ctl) — list, resume, read, watch and clean up Claude Code sessions.
 
 Shows saved and open sessions with their /rename names, resumes them from any
 folder, and can delete them.
@@ -15,30 +15,42 @@ live-process records from ~/.claude/sessions/<pid>.json.
 
 Examples:
   cctl                          # all sessions, newest first (= cctl ls)
-  cctl ls -n -l                 # numbered, open sessions marked (open)
-  cctl ls -v                    # full session IDs and transcript paths
-  cctl ls --named -p api        # renamed sessions in folders matching "api"
+  cctl ls -n                    # numbered, for use with resume and rm
+  cctl ls -ltr                  # long format, newest at the bottom
+  cctl ls -S -m 5               # the 5 biggest sessions
+  cctl ls -N -f api             # renamed sessions in folders matching "api"
+  cctl ls -s "login bug"        # search /rename names and AI titles
   cctl ls -m 10 --json          # newest 10, as JSON
 
   cctl resume my-name           # resume by /rename name, from any folder
-  cctl resume -p api            # pick from sessions in folders matching "api"
+  cctl resume -f api            # pick from sessions in folders matching "api"
   cctl resume 3 -- --model opus # list number; args after -- go to claude
 
   cctl rm my-name               # delete by name, ID (or prefix), or number
-  cctl rm -p /tmp/x --all       # delete every session under a folder
+  cctl rm -f /tmp/x --all       # delete every session under a folder
+  cctl rm old-test --force      # no questions asked (for scripts)
+
+  cctl log cctl-dev --tail 10   # the last 10 turns of a session, readable
+  cctl log 3 --tools | grep rm  # with tool output, piped (no pager)
+
+  cctl watch                    # live: what every open session is doing
+  cctl watch cctl-dev --verbose # one session, with full replies and errors
 """
 
 import argparse
 import json
+import re
+import subprocess
 import os
 import shlex
 import textwrap
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 DISCLAIMER = ("Claude Code is a product of Anthropic. cctl is an unofficial utility\n"
               "for Claude Code users, not made by or affiliated with Anthropic: it is\n"
               "only a wrapper script around Claude Code's local files and `claude` CLI.")
@@ -62,19 +74,51 @@ def pid_alive(pid):
     return True
 
 
+# Quick pre-check before parsing a transcript line. Tolerates JSON written with
+# or without spaces, so a formatting change in Claude Code doesn't hide messages.
+MESSAGE_LINE = re.compile(r'"type"\s*:\s*"(?:user|assistant)"')
+
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+CLAUDE_ID_ARG = re.compile(r"(?:--session-id|--resume|-r)[ =](" + UUID + ")")
+
+
+def running_claude_ids():
+    """Session IDs named on the command line of running claude processes.
+
+    Interactive sessions register in ~/.claude/sessions, but headless ones
+    (`claude -p ... --session-id <id>`) may not, so the process list is checked
+    too. A headless run started without an explicit ID can't be matched.
+    """
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,args="], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    ids = {}
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if not pid.isdigit() or not re.search(r"(^|/)claude(\s|$)|claude-code", args):
+            continue
+        for sid in CLAUDE_ID_ARG.findall(args):
+            ids.setdefault(sid, int(pid))
+    return ids
+
+
 def load_open_sessions():
     """Map sessionId -> live process record for Claude processes still running."""
     live = {}
-    if not SESSIONS_DIR.is_dir():
-        return live
-    for f in SESSIONS_DIR.glob("*.json"):
-        try:
-            rec = json.loads(f.read_text())
-        except (OSError, ValueError):
-            continue
-        sid, pid = rec.get("sessionId"), rec.get("pid")
-        if sid and isinstance(pid, int) and pid_alive(pid):
-            live[sid] = rec
+    if SESSIONS_DIR.is_dir():
+        for f in SESSIONS_DIR.glob("*.json"):
+            try:
+                rec = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            sid, pid = rec.get("sessionId"), rec.get("pid")
+            if sid and isinstance(pid, int) and pid_alive(pid):
+                live[sid] = rec
+    for sid, pid in running_claude_ids().items():
+        live.setdefault(sid, {"sessionId": sid, "pid": pid, "source": "ps"})
     return live
 
 
@@ -107,7 +151,7 @@ def parse_transcript(path):
         for line in fh:
             # Cheap substring checks before paying for json.loads on big lines.
             is_title = '"custom-title"' in line or '"ai-title"' in line
-            is_msg = '"type":"user"' in line or '"type":"assistant"' in line
+            is_msg = MESSAGE_LINE.search(line) is not None
             need_cwd = info["cwd"] is None and '"cwd"' in line
             if not (is_title or is_msg or need_cwd):
                 continue
@@ -147,13 +191,16 @@ def collect(live):
                 except (OSError, ValueError, AttributeError):
                     pass
             sessions[s["session_id"]] = s
-    # Open sessions that have not written a transcript yet.
+    # Open sessions that have not written a transcript yet. Only registered ones:
+    # a process seen in `ps` may belong to another Claude data folder.
     for sid, rec in live.items():
-        if sid not in sessions:
+        if sid not in sessions and rec.get("source") != "ps":
             sessions[sid] = {
                 "session_id": sid, "cwd": rec.get("cwd"), "custom_title": None,
                 "ai_title": None, "first_prompt": None, "messages": 0,
-                "modified": datetime.fromtimestamp((rec.get("updatedAt") or 0) / 1000),
+                "modified": (datetime.fromtimestamp(t / 1000)
+                             if (t := rec.get("updatedAt") or rec.get("startedAt"))
+                             else datetime.now()),
                 "file": None,
             }
     for sid, s in sessions.items():
@@ -189,8 +236,8 @@ def resolve_target(target, rows):
     Returns a list of (row, reason) pairs. reason is None only for a clean
     match: exactly one session whose /rename name equals TARGET, with TARGET
     not also being a substring of any other name or a session-ID prefix.
-    Anything else (duplicate names, substring matches, ID or list-number
-    matches) carries a reason and must be confirmed explicitly.
+    Anything else (duplicate names, substring matches, AI-title, ID or
+    list-number matches) carries a reason and must be confirmed explicitly.
     """
     t = target.lower()
     exact = [r for r in rows if (r["custom_title"] or "").lower() == t]
@@ -203,8 +250,12 @@ def resolve_target(target, rows):
         partial = [r for r in rows if r not in exact and t in (r["custom_title"] or "").lower()]
     # Session-ID prefixes need 4+ characters so short inputs don't hit random IDs.
     by_id = [r for r in rows if len(t) >= 4 and r["session_id"].lower().startswith(t)]
+    # AI titles count as names too, but they are Claude's guesses, not names you
+    # chose, so a match through one always needs a check before deleting.
+    by_ai = [] if by_num else [r for r in rows if t in (r["ai_title"] or "").lower()]
 
-    if len(exact) == 1 and not partial and not by_num and all(r is exact[0] for r in by_id):
+    if (len(exact) == 1 and not partial and not by_num
+            and all(r is exact[0] for r in by_id + by_ai)):
         return [(exact[0], None)]
 
     out, seen = [], set()
@@ -223,6 +274,8 @@ def resolve_target(target, rows):
     for r in by_id:
         add(r, "matched by session ID" if r["session_id"].lower() == t
             else f"matched by session-ID prefix {target!r}")
+    for r in by_ai:
+        add(r, f"AI title match: {r['ai_title']!r}")
     return out
 
 
@@ -235,10 +288,11 @@ def describe(r):
 def pick(cands, verb, multi):
     """Show numbered candidates and let the user choose. Returns chosen rows."""
     home = str(Path.home())
+    w = len(str(len(cands)))
     for i, (r, reason) in enumerate(cands, 1):
-        print(f"  {i}: {describe(r)}")
+        print(f"  {i:>{w}}: {describe(r)}")
         extra = f"  ({reason})" if reason else ""
-        print(f"       {(r['cwd'] or '').replace(home, '~', 1)}{extra}")
+        print(f"  {'':>{w}}  {(r['cwd'] or '').replace(home, '~', 1)}{extra}")
     if not sys.stdin.isatty():
         print(f"cctl: several sessions match; re-run in a terminal to choose, "
               f"or use a full session ID / exact name", file=sys.stderr)
@@ -266,7 +320,7 @@ def ask(prompt):
 
 
 def delete_sessions(targets, rows, assume_yes, force):
-    """Resolve targets, confirm as needed, then delete."""
+    """Resolve targets, confirm as needed, then delete. force: never ask."""
     sys.stdout.reconfigure(line_buffering=True)  # keep stdout/stderr in order
     plan, errors = [], 0  # plan: list of (row, reason_or_None)
     interactive = sys.stdin.isatty()
@@ -281,6 +335,13 @@ def delete_sessions(targets, rows, assume_yes, force):
             continue
         # Several candidates: the user must pick which ones.
         print(f"{target!r} matches {len(cands)} sessions:")
+        if force:  # --force never asks, and never guesses which one was meant
+            for r, reason in cands:
+                print(f"    {describe(r)}  ({reason})")
+            print(f"    skipped: use a full session ID or exact name with --force",
+                  file=sys.stderr)
+            errors += 1
+            continue
         chosen = pick(cands, "Delete", multi=True)
         if chosen is None:
             errors += 1
@@ -305,12 +366,12 @@ def delete_sessions(targets, rows, assume_yes, force):
             print(f"    {str(p).replace(home, '~', 1)}{'/' if p.is_dir() else ''}")
 
         risky = reason not in (None, "picked")
-        if risky or (reason is None and not assume_yes):
+        if not force and (risky or (reason is None and not assume_yes)):
             if risky:
                 print(f"    ! confirm needed: {reason}")
             if not interactive:
-                hint = ("use an exact, unique /rename name with -y to skip confirmation"
-                        if risky else "pass -y to confirm")
+                hint = ("use --force, or an exact, unique /rename name with -y"
+                        if risky else "pass -y or --force to confirm")
                 print(f"    skipped: not a terminal; {hint}", file=sys.stderr)
                 errors += 1
                 continue
@@ -329,19 +390,29 @@ def remove_paths(paths):
         except OSError as e:
             print(f"    error deleting {p}: {e}", file=sys.stderr)
             errors += 1
+    # Remove the project folder too once its last session is gone. rmdir only
+    # succeeds on empty folders, so a memory folder with content (or anything
+    # else) keeps the project folder in place.
+    for parent in {p.parent for p in paths if p.parent.parent == PROJECTS_DIR}:
+        try:
+            if [e.name for e in parent.iterdir()] == ["memory"]:
+                (parent / "memory").rmdir()
+            parent.rmdir()
+        except OSError:
+            pass
     print("    deleted" if not errors else "    partly deleted")
     return errors
 
 
 def delete_all(rows, prefix, force):
-    """Delete every listed session, after one confirmation. Requires -p."""
+    """Delete every listed session, after one confirmation (none with force). Requires -f."""
     sys.stdout.reconfigure(line_buffering=True)
     if not prefix or not prefix.strip(" /~.*"):
-        print("cctl: deleting all needs -p/--project with a real folder, "
-              "e.g. -p /tmp/my-scratch-dir", file=sys.stderr)
+        print("cctl: deleting all needs -f/--folder with a real folder, "
+              "e.g. -f /tmp/my-scratch-dir", file=sys.stderr)
         return 2
     if not rows:
-        print(f"No sessions match -p {prefix!r}; nothing to delete.")
+        print(f"No sessions match -f {prefix!r}; nothing to delete.")
         return 0
     targets, skipped = [], []
     for r in rows:
@@ -358,12 +429,14 @@ def delete_all(rows, prefix, force):
     if not targets:
         print("Nothing to delete.")
         return 1
-    if not sys.stdin.isatty():
-        print("cctl: deleting all must be confirmed in a terminal", file=sys.stderr)
-        return 1
-    if ask(f"\nDelete these {len(targets)} session(s)? [y/N] ") not in ("y", "yes"):
-        print("Nothing deleted.")
-        return 1
+    if not force:
+        if not sys.stdin.isatty():
+            print("cctl: deleting all must be confirmed in a terminal (or use --force)",
+                  file=sys.stderr)
+            return 1
+        if ask(f"\nDelete these {len(targets)} session(s)? [y/N] ") not in ("y", "yes"):
+            print("Nothing deleted.")
+            return 1
     failed = 0
     for r in targets:
         print(describe(r))
@@ -373,26 +446,30 @@ def delete_all(rows, prefix, force):
     return 1 if failed or skipped else 0
 
 
-def resume_session(target, rows, extra, force, dry_run):
-    """Find a session in any folder, cd into its folder and exec `claude --resume`."""
+def choose_one(target, rows, verb):
+    """One session for TARGET (or from the filtered list): picks if several match."""
     if target:
         cands = resolve_target(target, rows)
         if not cands:
             print(f"cctl: no session matches {target!r}", file=sys.stderr)
-            return 1
+            return None
     else:
         cands = [(r, None) for r in rows]
         if not cands:
             print("cctl: no sessions match the filters", file=sys.stderr)
-            return 1
+            return None
     if len(cands) == 1:
-        r = cands[0][0]
-    else:
-        print(f"{len(cands)} sessions match{' ' + repr(target) if target else ''}:")
-        chosen = pick(cands, "Resume", multi=False)
-        if not chosen:
-            return 1
-        r = chosen[0]
+        return cands[0][0]
+    print(f"{len(cands)} sessions match{' ' + repr(target) if target else ''}:")
+    chosen = pick(cands, verb, multi=False)
+    return chosen[0] if chosen else None
+
+
+def resume_session(target, rows, extra, force, dry_run):
+    """Find a session in any folder, cd into its folder and exec `claude --resume`."""
+    r = choose_one(target, rows, "Resume")
+    if r is None:
+        return 1
 
     name = r["custom_title"] or r["ai_title"] or r["session_id"]
     cwd = r["cwd"]
@@ -421,17 +498,330 @@ def resume_session(target, rows, extra, force, dry_run):
     os.execvp(cmd[0], cmd)  # hand the terminal over to claude; does not return
 
 
+# Wrapper tags Claude Code puts around non-conversation text in user turns.
+NOISE_TAG = re.compile(r"<(system-reminder|local-command-[a-z]+|task-notification|"
+                       r"command-message)\b.*?</\1>", re.S)
+
+
+def tool_detail(inp, prefer=("command", "file_path", "path", "pattern", "query", "url",
+                              "description", "prompt", "task_id")):
+    """The most telling input of a tool call, on one line ('' if none)."""
+    for k in prefer:
+        v = (inp or {}).get(k)
+        if isinstance(v, str) and v.strip():
+            return " ".join(v.split())
+    return ""
+
+
+def tool_summary(name, inp):
+    """One line for a tool call: its name and the most telling input."""
+    detail = tool_detail(inp)
+    return f"{name}: {shorten(detail, 100)}" if detail else (name or "tool")
+
+
+def transcript_turns(path, tools):
+    """Read a transcript as a list of turns: (who, timestamp, [text, ...])."""
+    turns = []
+
+    def add(who, ts, text):
+        if turns and turns[-1][0] == who:
+            turns[-1][2].append(text)
+        else:
+            turns.append((who, ts, [text]))
+
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not MESSAGE_LINE.search(line):
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            kind = e.get("type")
+            if kind not in ("user", "assistant") or e.get("isSidechain") or e.get("isMeta"):
+                continue
+            who, ts = ("you" if kind == "user" else "claude"), e.get("timestamp")
+            content = (e.get("message") or {}).get("content")
+            parts = ([{"type": "text", "text": content}] if isinstance(content, str)
+                     else content if isinstance(content, list) else [])
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "text":
+                    text = part.get("text") or ""
+                    cmd = re.search(r"<command-name>(.*?)</command-name>", text)
+                    if cmd:  # a slash command such as /rename
+                        args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+                        add(who, ts, f"{cmd.group(1)} {args.group(1).strip() if args else ''}".strip())
+                        continue
+                    text = NOISE_TAG.sub("", text).strip()
+                    if text:
+                        add(who, ts, text)
+                elif ptype == "tool_use":
+                    add("claude", ts, "→ " + tool_summary(part.get("name"), part.get("input")))
+                elif ptype == "tool_result" and tools:
+                    out = part.get("content")
+                    if isinstance(out, list):
+                        out = "\n".join(x.get("text", "") for x in out if isinstance(x, dict))
+                    out = (out or "").strip().splitlines()
+                    shown = out[:5] + ([f"… {len(out) - 5} more lines"] if len(out) > 5 else [])
+                    add("claude", ts, "\n".join("  ← " + l for l in shown) or "  ← (no output)")
+                elif ptype == "image":
+                    add(who, ts, "[image]")
+    return turns
+
+
+def log_session(target, rows, tail, tools, use_pager):
+    """Print a session's conversation as readable text."""
+    r = choose_one(target, rows, "Show")
+    if r is None:
+        return 1
+    if not r["file"]:
+        print("cctl: this session has no saved transcript yet", file=sys.stderr)
+        return 1
+    turns = transcript_turns(r["file"], tools)
+    if tail:
+        turns = turns[-tail:]
+
+    tty = sys.stdout.isatty()
+    color = tty and not os.environ.get("NO_COLOR")
+    style = lambda code, t: f"\033[{code}m{t}\033[0m" if color else t
+    home = str(Path.home())
+    name = r["custom_title"] or r["ai_title"] or "(unnamed)"
+    out = [style("1", name),
+           style("2", f"{r['session_id']}  {(r['cwd'] or '').replace(home, '~', 1)}"),
+           style("2", f"{len(turns)} turn(s){' (last ' + str(tail) + ')' if tail else ''}"
+                      f"{'' if tools else ', tool output hidden (--tools shows it)'}"), ""]
+    for who, ts, texts in turns:
+        try:
+            when = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+            when = when.strftime("%Y-%m-%d %H:%M")
+        except (AttributeError, ValueError):
+            when = ""
+        label = f"── {who} · {when} " if when else f"── {who} "
+        out.append(style("1;36" if who == "you" else "1;32", label + "─" * max(0, 40 - len(label))))
+        for text in texts:
+            out.append(style("2", text) if text.startswith(("→", "  ←")) else text)
+        out.append("")
+    text = "\n".join(out)
+
+    pager = os.environ.get("PAGER", "less -RFX")
+    if use_pager and tty and shutil.which(shlex.split(pager)[0]):
+        try:
+            subprocess.run(shlex.split(pager), input=text.encode(), check=False)
+            return 0
+        except OSError:
+            pass
+    print(text)
+    return 0
+
+
+# watch: a live feed of what sessions do, one line per action. Adapted from the
+# `watch` command of the author's piri-harness, rewritten for Claude Code's own
+# transcripts so it works on any session, interactive or headless.
+WATCH_PREFER = ("description", "file_path", "command", "pattern", "path", "query", "url",
+                "prompt", "task_id")
+
+
+def actions(entry, verbose):
+    """One transcript entry -> [(timestamp, kind, detail)] worth showing."""
+    if entry.get("isSidechain") or entry.get("isMeta"):
+        return []
+    ts, kind = entry.get("timestamp") or "", entry.get("type")
+    content = (entry.get("message") or {}).get("content")
+    parts = ([{"type": "text", "text": content}] if isinstance(content, str)
+             else content if isinstance(content, list) else [])
+    out = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if kind == "assistant" and ptype == "tool_use":
+            name = (part.get("name") or "tool").replace("mcp__", "")
+            out.append((ts, name, tool_detail(part.get("input"), WATCH_PREFER)))
+        elif ptype == "text":
+            text = part.get("text") or ""
+            cmd = re.search(r"<command-name>(.*?)</command-name>", text)
+            text = cmd.group(1) if cmd else NOISE_TAG.sub("", text).strip()
+            if text and kind in ("user", "assistant"):
+                lines = text.splitlines()
+                shown = text if verbose else lines[0] + (" …" if len(lines) > 1 else "")
+                out.append((ts, "you" if kind == "user" else "says", shown))
+        elif verbose and ptype == "tool_result" and part.get("is_error"):
+            body = part.get("content")
+            if isinstance(body, list):
+                body = " ".join(b.get("text", "") for b in body if isinstance(b, dict))
+            out.append((ts, "!", (str(body or "error").strip().splitlines() or ["error"])[0]))
+    return out
+
+
+class Follower:
+    """Remembers how far each file was read, so each poll returns only new, complete lines."""
+
+    def __init__(self):
+        self.offsets = {}
+
+    def read(self, path, from_start=False):
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                start = 0 if from_start else self.offsets.get(path, 0)
+                if start > size:  # file was replaced or truncated
+                    start = 0
+                fh.seek(start)
+                data = fh.read()
+        except OSError:
+            return []
+        cut = data.rfind(b"\n") + 1  # keep a half-written last line for the next poll
+        self.offsets[path] = start + cut
+        return data[:cut].decode("utf-8", "replace").splitlines()
+
+
+def watch_sessions(target, rows, refresh, tail, verbose, once, interval=1.0):
+    """Follow one session (TARGET) or every open session, printing actions as they happen."""
+    tty = sys.stdout.isatty()
+    color = tty and not os.environ.get("NO_COLOR")
+    style = lambda code, t: f"\033[{code}m{t}\033[0m" if color else t
+    kind_style = {"says": "0", "you": "1;36", "!": "31"}
+
+    if target:
+        r = choose_one(target, rows, "Watch")
+        if r is None:
+            return 1
+        pinned = r["session_id"]
+    else:
+        pinned = None
+
+    def current():
+        """Sessions to follow now: the pinned one, or every open one."""
+        found = refresh()
+        if pinned:
+            return [r for r in found if r["session_id"] == pinned]
+        return [r for r in found if r["open"]]
+
+    def label(r):
+        return shorten(r["custom_title"] or r["ai_title"] or r["first_prompt"]
+                       or r["session_id"][:8], 20)
+
+    def when(ts):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
+        except (AttributeError, ValueError):
+            return "        "
+
+    follower, following = Follower(), {}
+    tag_w = 0
+
+    def emit(batch):
+        # batch: [(ts, session label, kind, detail)], printed in time order
+        for ts, tag, kind, detail in sorted(batch, key=lambda x: x[0]):
+            cols = [style("2", when(ts))]
+            if not pinned:
+                cols.append(style("2", f"{tag:<{tag_w}}"))
+            cols.append(style(kind_style.get(kind, "36"), f"{kind:<8}"))
+            print("  ".join(cols) + " " + detail)
+
+    def history(r, n):
+        lines = follower.read(r["file"], from_start=True)
+        if not n:
+            return []
+        acts = []
+        for line in lines:
+            try:
+                acts += actions(json.loads(line), verbose)
+            except ValueError:
+                pass
+        return [(ts, label(r), k, d) for ts, k, d in acts[-n:]]
+
+    def start(rs, n):
+        nonlocal tag_w
+        batch = []
+        for r in rs:
+            if r["file"] and r["session_id"] not in following:
+                following[r["session_id"]] = r
+                tag_w = max(tag_w, len(label(r)))
+                batch += history(r, n)
+        return batch
+
+    rs = current()
+    home = str(Path.home())
+    if pinned:
+        r = rs[0] if rs else r
+        state = "open" if r["open"] else "not open, showing what it did"
+        print(style("1", f"== {label(r)}  {r['session_id'][:8]}  "
+                         f"{(r['cwd'] or '').replace(home, '~', 1)}  ({state})"))
+    else:
+        print(style("1", f"== watching {len(rs)} open session(s)"
+                         + (": " + ", ".join(label(r) for r in rs) if rs else "")))
+    emit(start(rs, tail))
+    if once:
+        return 0
+    if not pinned and not rs:
+        print(style("2", "waiting for sessions to open… (Ctrl-C to stop)"))
+    elif tty:
+        print(style("2", "following… (Ctrl-C to stop)"))
+
+    polls = 0
+    try:
+        while True:
+            time.sleep(interval)
+            polls += 1
+            batch = []
+            for sid, r in list(following.items()):
+                for line in follower.read(r["file"]):
+                    try:
+                        batch += [(ts, label(r), k, d) for ts, k, d in actions(json.loads(line), verbose)]
+                    except ValueError:
+                        pass
+            emit(batch)
+            if polls % 5 == 0:  # every few seconds, pick up sessions that opened or closed
+                now = {r["session_id"]: r for r in current()}
+                for sid in following:  # refresh names: a new session gets one after its first turns
+                    if sid in now and now[sid]["file"]:
+                        following[sid] = now[sid]
+                for sid in [s for s in following if s not in now and not pinned]:
+                    print(style("2", f"== {label(following.pop(sid))} closed"))
+                new = [r for sid, r in now.items() if sid not in following]
+                for r in new:
+                    if r["file"]:
+                        print(style("2", f"== {label(r)} opened"))
+                emit(start(new, 0))
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
 def filtered_rows(args, live):
     rows = collect(live)
     if getattr(args, "open", False):
         rows = [r for r in rows if r["open"]]
     if args.named:
         rows = [r for r in rows if r["custom_title"]]
-    if args.project:
-        rows = [r for r in rows if args.project.lower() in (r["cwd"] or "").lower()]
-    rows.sort(key=lambda r: r["modified"], reverse=True)
+    if args.folder:
+        rows = [r for r in rows if args.folder.lower() in (r["cwd"] or "").lower()]
+    if args.session:
+        t = args.session.lower()
+        # Names only: the /rename name and the AI title. A session with neither is
+        # matched on the start of its first message, which is what ls shows for it.
+        # (Searching whole first messages matched long pasted briefs at random.)
+        def names(r):
+            if r["custom_title"] or r["ai_title"]:
+                return [r["custom_title"], r["ai_title"]]
+            return [shorten(r["first_prompt"] or "", 40)]
+        rows = [r for r in rows if any(t in (n or "").lower() for n in names(r))]
+    # Order like ls: newest first (-t, the default) or most messages first (-S).
+    # -m keeps the first N in that order; -r then reverses what is shown, so
+    # `cctl ls -ltr` puts the newest session at the bottom, next to the prompt.
+    if args.size:
+        rows.sort(key=lambda r: (r["messages"], r["modified"]), reverse=True)
+    else:
+        rows.sort(key=lambda r: r["modified"], reverse=True)
     if args.limit:
         rows = rows[: args.limit]
+    if args.reverse:
+        rows.reverse()
     return rows
 
 
@@ -439,17 +829,14 @@ def print_list(rows, args):
     if args.json:
         out = []
         for r in rows:
-            d = dict(r, modified=r["modified"].isoformat(timespec="seconds"))
-            if not args.status:
-                for k in ("open", "pid", "status"):
-                    d.pop(k, None)
-            out.append(d)
+            out.append(dict(r, modified=r["modified"].isoformat(timespec="seconds")))
         json.dump(out, sys.stdout, indent=2)
         print()
         return
 
     if not rows:
-        used = [f"-p {args.project!r}" if args.project else "",
+        used = [f"-f {args.folder!r}" if args.folder else "",
+                f"-s {args.session!r}" if args.session else "",
                 "--named" if args.named else "", "--open" if args.open else ""]
         used = " ".join(u for u in used if u)
         print(f"No sessions match {used}." if used else "No sessions found.")
@@ -461,46 +848,78 @@ def print_list(rows, args):
     dim = (lambda t: f"\033[2m{t}\033[0m") if color else (lambda t: t)
     home = str(Path.home())
 
-    width = len(str(len(rows)))
-    for i, r in enumerate(rows, 1):
-        num = f"{i:>{width}}: " if args.number else ""
-        pad = " " * len(num)
-        sid = r["session_id"] if args.long else r["session_id"][:8]
-        when = r["modified"].strftime("%Y-%m-%d %H:%M")
-        cwd = (r["cwd"] or "").replace(home, "~", 1)
+    # One line per session, never truncated: the terminal wraps long lines, and
+    # grep/sort/awk always see the whole record. Fixed-width columns come first,
+    # the variable ones (SESSION, FOLDER, TRANSCRIPT) last.
+    def name_of(r):
         if r["custom_title"]:
-            name = bold(r["custom_title"])
-        else:
-            name = dim("(unnamed) ") + shorten(r["ai_title"] or r["first_prompt"] or "", 60)
-        tag = ""
-        if args.status and r["open"]:
-            tag = " " + green(f"(open{', ' + r['status'] if r['status'] else ''}, pid {r['pid']})")
-        print(f"{num}{sid}  {when}  {r['messages']:>5} msgs  {cwd}")
-        print(f"{pad}    {name}{tag}")
-        if args.long and r["file"]:
-            print(dim(f"{pad}    {r['file'].replace(home, '~', 1)}"))
+            return r["custom_title"], bold
+        # No /rename name: show the AI title (or first message), dimmed.
+        return (r["ai_title"] or shorten(r["first_prompt"] or "", 40) or "-"), dim
+
+    num_w = len(str(len(rows))) + 1  # "12:"
+    sid_w = max(len(r["session_id"]) for r in rows) if args.long else 8
+    name_w = max(min(max(len(name_of(r)[0]) for r in rows), 40), len("SESSION"))
+    folder = lambda r: (r["cwd"] or "-").replace(home, "~", 1)
+    folder_w = min(max(len(folder(r)) for r in rows), 40) if args.long else 0
+    cols = []
+    if args.number:
+        cols.append(f"{'#':>{num_w}}")
+    cols += [f"{'ID':<{sid_w}}", f"{'LAST ACTIVE':<16}", f"{'MSGS':>5}", f"{'STATE':<5}"]
+    if args.long:
+        cols.append(f"{'PID':>6}")
+    cols += [f"{'SESSION':<{name_w}}", f"{'FOLDER':<{folder_w}}"]
+    if args.long:
+        cols.append("TRANSCRIPT")
+    print(bold("  ".join(cols)))
+
+    for i, r in enumerate(rows, 1):
+        name, style = name_of(r)
+        state = "open" if r["open"] else "-"
+        cols = []
+        if args.number:
+            cols.append(f"{str(i) + ':':>{num_w}}")
+        cols += [f"{r['session_id'] if args.long else r['session_id'][:8]:<{sid_w}}",
+                 r["modified"].strftime("%Y-%m-%d %H:%M"),
+                 f"{r['messages']:>5}",
+                 green(f"{state:<5}") if r["open"] else dim(f"{state:<5}")]
+        if args.long:
+            cols.append(f"{r['pid'] or '-':>6}")
+        cols += [style(f"{name:<{name_w}}"), f"{folder(r):<{folder_w}}"]
+        if args.long:
+            cols.append((r["file"] or "-").replace(home, "~", 1))
+        print("  ".join(cols))
 
     n_open = sum(1 for r in rows if r.get("open"))
     summary = f"\n{len(rows)} session(s)"
-    if args.status:
-        summary += f", {n_open} open"
+    summary += f", {n_open} open"
     print(dim(summary))
     print(dim("Resume: cctl resume <name|id|number>   Delete: cctl rm <name|id|number>"))
 
 
 COMMANDS = {"ls": "ls", "list": "ls", "resume": "resume", "r": "resume",
-            "rm": "rm", "delete": "rm"}
+            "rm": "rm", "delete": "rm", "log": "log", "watch": "watch"}
+TARGET_HELP = ("/rename name, AI title or part of either, session ID (or prefix), "
+               "or list number")
 
 
 def build_parser():
     filters = argparse.ArgumentParser(add_help=False)
-    g = filters.add_argument_group("filters (numbers from `cctl ls -n` refer to the same filtered list)")
-    g.add_argument("-p", "--project", metavar="TEXT",
+    g = filters.add_argument_group("filters and order (keep them the same when using numbers)")
+    g.add_argument("-f", "--folder", metavar="TEXT",
                    help="only sessions whose folder contains TEXT")
-    g.add_argument("--named", action="store_true", help="only sessions renamed with /rename")
+    g.add_argument("-s", "--session", metavar="TEXT",
+                   help="only sessions whose /rename name or AI title contains TEXT")
+    g.add_argument("-N", "--named", action="store_true", help="only sessions renamed with /rename")
     g.add_argument("-o", "--open", action="store_true",
-                   help="only sessions that are currently open (implies -l)")
-    g.add_argument("-m", "--limit", type=int, metavar="N", help="at most N newest sessions")
+                   help="only sessions that are currently open")
+    g.add_argument("-m", "--limit", type=int, metavar="N",
+                   help="at most N sessions (the first N in sort order)")
+    g.add_argument("-t", "--time", action="store_true",
+                   help="sort by last activity, newest first (the default)")
+    g.add_argument("-S", "--size", action="store_true",
+                   help="sort by message count, most first")
+    g.add_argument("-r", "--reverse", action="store_true", help="reverse the order")
 
     ap = argparse.ArgumentParser(
         prog="cctl",
@@ -511,19 +930,11 @@ def build_parser():
 
     ls = sub.add_parser("ls", aliases=["list"], parents=[filters],
                         help="list sessions (default)", description="List sessions, newest first.")
-    ls.add_argument("-l", "--list", dest="status", action="store_true",
-                    help="list which sessions are open, e.g. (open, busy, pid 123)")
-    ls.add_argument("--status", dest="status", action="store_true", help=argparse.SUPPRESS)
     ls.add_argument("-n", "--number", action="store_true",
-                    help="number the list (numbers work with resume and rm)")
-    ls.add_argument("-v", "--verbose", "--long", dest="long", action="store_true",
-                    help="also show the full session ID and transcript path")
+                    help="number the list (numbers work as TARGETs in the other commands)")
+    ls.add_argument("-l", "--long", dest="long", action="store_true",
+                    help="long format: full session ID, PID and transcript path")
     ls.add_argument("--json", action="store_true", help="output JSON")
-    # Older flag-style deletes, kept as aliases for `cctl rm`.
-    ls.add_argument("-d", "--delete", nargs="+", metavar="TARGET", help=argparse.SUPPRESS)
-    ls.add_argument("--delete-all", action="store_true", help=argparse.SUPPRESS)
-    ls.add_argument("-y", "--yes", action="store_true", help=argparse.SUPPRESS)
-    ls.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
 
     rs = sub.add_parser(
         "resume", aliases=["r"], parents=[filters],
@@ -532,8 +943,7 @@ def build_parser():
                     "`claude --resume <id>`. With no TARGET, pick from the (filtered) list.",
         epilog="Anything after `--` is passed to claude, e.g. "
                "`cctl resume my-name -- --model opus`. Set CCTL_CLAUDE to use another claude binary.")
-    rs.add_argument("target", nargs="?", metavar="TARGET",
-                    help="/rename name (or part of it), session ID (or prefix), or list number")
+    rs.add_argument("target", nargs="?", metavar="TARGET", help=TARGET_HELP)
     rs.add_argument("--force", action="store_true", help="resume even if the session is already open")
     rs.add_argument("--dry-run", action="store_true",
                     help="print the command instead of running it")
@@ -541,24 +951,55 @@ def build_parser():
     rm = sub.add_parser(
         "rm", aliases=["delete"], parents=[filters],
         help="delete sessions",
-        description="Delete sessions by name, ID or list number. Only an exact, unique "
-                    "/rename name can skip confirmation (with -y); IDs, numbers, duplicate "
-                    "or partial names always ask.")
-    rm.add_argument("targets", nargs="*", metavar="TARGET",
-                    help="/rename name (or part of it), session ID (or prefix), or list number")
+        description="Delete sessions by name, AI title, ID or list number. Asks first, "
+                    "except for an exact, unique /rename name with -y; --force never asks.")
+    rm.add_argument("targets", nargs="*", metavar="TARGET", help=TARGET_HELP)
     rm.add_argument("--all", action="store_true",
-                    help="delete every session matched by -p (required), after one confirmation")
+                    help="delete every session matched by -f (required), after one confirmation")
     rm.add_argument("-y", "--yes", action="store_true",
                     help="don't ask for an exact, unique /rename name match")
-    rm.add_argument("--force", action="store_true", help="also delete sessions that are open")
+    rm.add_argument("--force", action="store_true",
+                    help="never ask (for scripts); also deletes open sessions. A TARGET "
+                         "that matches several sessions is still refused")
+
+    lg = sub.add_parser(
+        "log", parents=[filters],
+        help="print a session's conversation",
+        description="Print a session's conversation as readable text: your messages, "
+                    "Claude's replies, and one line per tool call. With no TARGET, pick "
+                    "from the (filtered) list. Uses $PAGER (default less) in a terminal.")
+    lg.add_argument("target", nargs="?", metavar="TARGET", help=TARGET_HELP)
+    lg.add_argument("--tail", type=int, metavar="N", help="only the last N turns")
+    lg.add_argument("--tools", action="store_true",
+                    help="also show tool output (first 5 lines of each)")
+    lg.add_argument("--no-pager", dest="pager", action="store_false",
+                    help="print straight to the terminal")
+
+    wt = sub.add_parser(
+        "watch", parents=[filters],
+        help="watch sessions live, one line per action",
+        description="Follow sessions as they work, one line per action: each tool call, "
+                    "the first line of each reply, and your messages. With no TARGET, "
+                    "follows every open session (interactive or headless), picking up "
+                    "new ones as they start. Ctrl-C stops.")
+    wt.add_argument("target", nargs="?", metavar="TARGET", help=TARGET_HELP)
+    wt.add_argument("--tail", type=int, default=10, metavar="N",
+                    help="first show the last N actions of each session (default 10; 0 = "
+                         "only new ones)")
+    wt.add_argument("--verbose", action="store_true",
+                    help="full replies, and tool errors marked with !")
+    wt.add_argument("--once", action="store_true", help="show what happened so far, then exit")
 
     overview = build_overview(filters, [
         ("ls, list", "[options]", ls, "list sessions, newest first (the default)"),
         ("resume, r", "[TARGET] [options] [-- claude-args]", rs,
          "resume a session from any folder (cd + claude --resume)"),
         ("rm, delete", "[TARGET ...] [options]", rm, "delete sessions, with confirmation"),
+        ("log", "[TARGET] [options]", lg, "print a session's conversation as readable text"),
+        ("watch", "[TARGET] [options]", wt, "watch sessions live, one line per action"),
     ])
     ap.format_help = lambda: overview
+    ap.cctl_subparsers = {"ls": ls, "resume": rs, "rm": rm, "log": lg, "watch": wt}
     ap.usage = "cctl [<command>] [options]   (cctl -h for everything)"
     return ap
 
@@ -600,12 +1041,14 @@ def build_overview(filters, commands):
     ]
     for name, args, p, summary in commands:
         lines.append(f"  {name:<14}{summary}")
-    lines += ["", "Choosing a session (TARGET, for resume and rm):",
+    lines.append(f"  {'help [cmd]':<14}this page, or one command's help (e.g. cctl help rm)")
+    lines += ["", "Choosing a session (TARGET, for resume, rm, log and watch):",
               "    my-name         /rename name; part of a name also works, after a check",
+              "    \"login bug\"     AI title, or part of it (rm always asks)",
               "    1a2b3c4d...     session ID, or its first 4+ characters",
               "    3               number from `cctl ls -n` (use the same filters)",
               "",
-              "Filters (every command):"]
+              "Filters and order (every command; keep them the same when using numbers):"]
     lines += opt_lines(filters._actions)
     for name, args, p, summary in commands:
         lines += ["", f"cctl {name.split(',')[0]} {args}"]
@@ -613,23 +1056,22 @@ def build_overview(filters, commands):
     lines += [
         "",
         "Other:",
-        "    -h, --help          this page; `cctl <command> -h` for one command",
-        "    -v, --version       print the version (as the first argument; `cctl ls -v`",
-        "                        is verbose)",
+        "    -h, --help          this page; `cctl <command> -h` or `cctl help <command>`",
+        "                        for one command",
+        "    -v, --version       print the version",
         "",
         "Safety:",
         "    rm asks before deleting, except an exact, unique /rename name with -y.",
-        "    IDs, list numbers, duplicate or partial names always ask, even with -y.",
-        "    rm --all needs -p, shows the list and asks once. Open sessions are never",
-        "    deleted or resumed twice without --force (or a yes at the prompt).",
-        "",
-        "Older flags (still work):",
-        "    cctl -d TARGET ...        same as  cctl rm TARGET ...",
-        "    cctl --delete-all -p X    same as  cctl rm --all -p X",
+        "    IDs, numbers, AI titles, duplicate or partial names ask, even with -y.",
+        "    rm --all needs -f, shows the list and asks once. Open sessions are not",
+        "    deleted, and resume warns before opening one twice.",
+        "    --force never asks (for scripts) and includes open sessions, but still",
+        "    refuses a TARGET that matches several sessions.",
         "",
         "Environment:",
         "    CLAUDE_CONFIG_DIR   Claude Code data folder (default ~/.claude)",
         "    CCTL_CLAUDE         claude program used by resume (default: claude on PATH)",
+        "    PAGER               pager used by log (default: less -RFX)",
         "    NO_COLOR            turn off colors",
         "",
     ]
@@ -647,46 +1089,56 @@ def main():
         i = argv.index("--")
         argv, extra = argv[:i], argv[i + 1:]
     if argv and not argv[0].startswith("-") and argv[0] not in COMMANDS:
-        print(f"cctl: unknown command {argv[0]!r} (commands: ls, resume, rm; "
-              f"see cctl -h)", file=sys.stderr)
-        sys.exit(2)
+        if argv[0] != "help":
+            print(f"cctl: unknown command {argv[0]!r} (commands: ls, resume, rm, log, watch, help; "
+                  f"see cctl -h)", file=sys.stderr)
+            sys.exit(2)
     if argv[:1] in (["-v"], ["--version"]):
         print(f"cctl {__version__}\n\n{DISCLAIMER}")
         sys.exit(0)
-    if not argv or (argv[0] not in COMMANDS and argv[0] not in ("-h", "--help")):
+    if not argv or (argv[0] not in COMMANDS and argv[0] not in ("-h", "--help", "help")):
         argv = ["ls", *argv]  # bare `cctl` / old flag style means `cctl ls`
 
     ap = build_parser()
-    args = ap.parse_args(argv)
+    if argv[0] == "help":  # git-style: cctl help [command]
+        if len(argv) == 1:
+            ap.print_help()
+        elif len(argv) == 2 and argv[1] in COMMANDS:
+            ap.cctl_subparsers[COMMANDS[argv[1]]].print_help()
+        else:
+            print(f"cctl: no help for {' '.join(argv[1:])!r} (commands: ls, resume, rm, log, watch)",
+                  file=sys.stderr)
+            sys.exit(2)
+        sys.exit(0)
+    args, unknown = ap.parse_known_args(argv)
     cmd = COMMANDS[args.cmd]
+    if unknown:  # report against the subcommand, so its own usage line is shown
+        ap.cctl_subparsers[cmd].error(f"unrecognized arguments: {' '.join(unknown)}")
     if extra and cmd != "resume":
         ap.error("arguments after `--` are only used by `cctl resume`")
 
-    # Old flag-style deletes map onto rm.
-    if cmd == "ls" and (args.delete or args.delete_all):
-        if args.delete and args.delete_all:
-            ap.error("use either --delete or --delete-all, not both")
-        cmd, args.targets, args.all = "rm", args.delete or [], args.delete_all
-
-    if args.open:
-        args.status = True
-    # Open status is always needed by resume and rm, to protect running sessions.
-    live = load_open_sessions() if (cmd != "ls" or args.status) else {}
+    # Open status is cheap (a few small files + a process check), so always load it.
+    live = load_open_sessions()
     rows = filtered_rows(args, live)
 
     if cmd == "ls":
         print_list(rows, args)
     elif cmd == "resume":
         sys.exit(resume_session(args.target, rows, extra, args.force, args.dry_run))
+    elif cmd == "log":
+        sys.exit(log_session(args.target, rows, args.tail, args.tools, args.pager))
+    elif cmd == "watch":
+        refresh = lambda: filtered_rows(args, load_open_sessions())
+        sys.exit(watch_sessions(args.target, rows, refresh, args.tail, args.verbose, args.once))
     else:
         if args.all:
             if args.targets:
                 ap.error("use either TARGETs or --all, not both")
-            if not args.project:
-                ap.error("--all only works together with -p/--project (to avoid wiping everything)")
-            sys.exit(delete_all(rows, args.project, args.force))
+            if not args.folder:
+                ap.error("--all only works together with -f/--folder (to avoid wiping everything)")
+            sys.exit(delete_all(rows, args.folder, args.force))
         if not args.targets:
-            ap.error("rm needs at least one TARGET, or --all with -p")
+            ap.error("rm needs at least one TARGET, or --all with -f")
         sys.exit(delete_sessions(args.targets, rows, args.yes, args.force))
 
 
